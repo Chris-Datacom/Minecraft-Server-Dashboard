@@ -77,6 +77,7 @@ pacstrap -K /mnt \
   qemu-guest-agent \
   openssh \
   networkmanager \
+  jdk21-openjdk \
   sudo \
   ca-certificates \
   curl

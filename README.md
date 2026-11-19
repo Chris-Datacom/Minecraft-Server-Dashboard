@@ -45,7 +45,7 @@ Configure the Cloudflare Tunnel hostname `blockhost.krumpy.xyz` to forward to `h
 
 ## Arch VM template
 
-[`scripts/arch-template-install.sh`](./scripts/arch-template-install.sh) installs the Arch base system, GRUB for a SeaBIOS VM, Cloud-Init, QEMU Guest Agent, SSH, and DHCP networking from an Arch live ISO. It erases the selected whole disk only after you confirm by typing `ERASE`; verify the disk name and size before confirming.
+[`scripts/arch-template-install.sh`](./scripts/arch-template-install.sh) installs the Arch base system, OpenJDK 21, GRUB for a SeaBIOS VM, Cloud-Init, QEMU Guest Agent, SSH, and DHCP networking from an Arch live ISO. It erases the selected whole disk only after you confirm by typing `ERASE`; verify the disk name and size before confirming.
 
 Run the script as root from the live ISO, passing the VM disk (for example `/dev/sda`) or letting it prompt:
 
@@ -55,7 +55,7 @@ bash arch-template-install.sh /dev/sda
 
 After installation, detach the ISO in Proxmox, add a Cloud-Init drive, boot from the disk, and validate a test clone before converting the VM to a template. Build and validate a custom Arch ISO profile only after this base install is confirmed.
 
-For prompt end-user provisioning, Blockhost should clone the validated Cloud-Init template through the Proxmox API rather than run the ISO installer for each server. The custom ISO is for repeatable template installation and recovery.
+Install and validate this VM once, then convert it to a Proxmox template. Each clone inherits Arch, OpenJDK 21, Cloud-Init, QEMU Guest Agent, and the base networking/SSH setup. Blockhost should clone that template through the Proxmox API rather than run the ISO installer for each server. Paper JARs, server properties, and EULA acceptance are per-server provisioning steps; do not pre-accept the EULA in the shared template.
 
 ### Proxmox connectivity
 
