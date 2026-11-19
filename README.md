@@ -43,6 +43,20 @@ sudo systemctl status blockhost --no-pager
 
 Configure the Cloudflare Tunnel hostname `blockhost.krumpy.xyz` to forward to `http://127.0.0.1:3000`. Do not expose the app or PostgreSQL ports directly to the internet. Keep PostgreSQL backups.
 
+## Arch VM template
+
+[`scripts/arch-template-install.sh`](./scripts/arch-template-install.sh) installs the Arch base system, GRUB for a SeaBIOS VM, Cloud-Init, QEMU Guest Agent, SSH, and DHCP networking from an Arch live ISO. It erases the selected whole disk only after you confirm by typing `ERASE`; verify the disk name and size before confirming.
+
+Run the script as root from the live ISO, passing the VM disk (for example `/dev/sda`) or letting it prompt:
+
+```sh
+bash arch-template-install.sh /dev/sda
+```
+
+After installation, detach the ISO in Proxmox, add a Cloud-Init drive, boot from the disk, and validate a test clone before converting the VM to a template. Build and validate a custom Arch ISO profile only after this base install is confirmed.
+
+For prompt end-user provisioning, Blockhost should clone the validated Cloud-Init template through the Proxmox API rather than run the ISO installer for each server. The custom ISO is for repeatable template installation and recovery.
+
 ### Proxmox connectivity
 
 Allow the Debian VM to reach the Proxmox API over HTTPS. Keep certificate verification enabled: install your Proxmox CA certificate into Debian's trusted CA store if needed. Do not disable TLS verification or expose the Proxmox token to browser code. The `/api/admin/proxmox/status` endpoint looks up the configured VM by ID and name through the cluster resources API, so it can find the VM on any node in that cluster. It verifies the signed-in Discord account against `DISCORD_ADMIN_USER_IDS` on every request and returns `401` or `403` otherwise.
