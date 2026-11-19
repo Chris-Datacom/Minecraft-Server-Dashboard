@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#10130f" />
+    <meta name="description" content="A clean control panel for your Minecraft servers." />
+    <title>Blockhost — Server Control</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="login-screen" class="login-screen">
+      <div class="login-art" aria-hidden="true">
+        <div class="art-grid"></div>
+        <div class="art-glow"></div>
+        <div class="art-cube cube-one"></div>
+        <div class="art-cube cube-two"></div>
+        <div class="art-cube cube-three"></div>
+        <div class="art-caption"><span class="status-dot"></span> YOUR WORLD, YOUR RULES</div>
+        <div class="art-copy">
+          <div class="eyebrow">THE BLOCKHOST CONTROL PANEL</div>
+          <h1>Every world.<br />One <span>place.</span></h1>
+          <p>Keep your servers running smoothly, and spend more time playing.</p>
+        </div>
+        <div class="art-footer"><span>BUILT FOR YOUR NEXT ADVENTURE</span><span>01 — 04</span></div>
+      </div>
+      <main class="login-main">
+        <div class="login-brand"><span class="brand-mark">B</span><span>blockhost<span class="brand-period">.</span></span></div>
+        <div class="login-card">
+          <div class="eyebrow">WELCOME BACK</div>
+          <h2>Sign in to your panel</h2>
+          <p class="login-subtitle">Sign in to manage your Minecraft servers.</p>
+          <a id="discord-login" class="button button-discord login-submit" href="/auth/discord"><span class="discord-mark">◉</span> Continue with Discord <span aria-hidden="true">→</span></a>
+          <p class="login-footnote discord-footnote">Discord is the only sign-in provider. Admin access is granted to approved Discord accounts.</p>
+          <div class="login-divider"><span></span> OR <span></span></div>
+          <button id="demo-login" class="button button-secondary demo-button"><span class="demo-icon">◈</span> Explore demo dashboard</button>
+          <p class="login-footnote">Demo mode uses sample data stored only in this browser.</p>
+        </div>
+        <div class="login-legal">© 2025 BLOCKHOST <span>•</span> YOUR SERVER, YOUR RULES</div>
+      </main>
+    </div>
+
+    <div id="app" class="app-shell" hidden>
+      <aside class="sidebar">
+        <a href="#" class="sidebar-brand" data-page="overview"><span class="brand-mark">B</span><span>blockhost<span class="brand-period">.</span></span></a>
+        <div class="workspace-label">WORKSPACE <button id="workspace-menu" aria-label="Workspace menu">⌄</button></div>
+        <div class="workspace-card"><span class="workspace-avatar" id="workspace-avatar">M</span><span><strong id="workspace-name">My workspace</strong><small>Personal workspace</small></span><span class="workspace-dots">···</span></div>
+        <nav class="main-nav" aria-label="Main navigation">
+          <div class="nav-section-label">MANAGE</div>
+          <button class="nav-link active" data-page="overview"><span class="nav-icon">◫</span> Overview</button>
+          <button class="nav-link" data-page="servers"><span class="nav-icon">▦</span> Servers <span id="server-nav-count" class="nav-count" hidden>0</span></button>
+          <button class="nav-link auth-nav" data-page="minecraft" hidden><span class="nav-icon">⌘</span> Optional plugin API</button>
+          <button class="nav-link" data-page="files"><span class="nav-icon">▤</span> File manager</button>
+          <button class="nav-link" data-page="console"><span class="nav-icon">⌘</span> Console</button>
+          <button class="nav-link" data-page="backups"><span class="nav-icon">⟳</span> Backups</button>
+          <button class="nav-link admin-nav" id="admin-nav" data-page="infrastructure" hidden><span class="nav-icon">◉</span> Infrastructure</button>
+          <button class="nav-link admin-nav" id="plans-nav" data-page="plans" hidden><span class="nav-icon">◇</span> Plans & accounts</button>
+          <div class="nav-section-label nav-section-spaced">PREFERENCES</div>
+          <button class="nav-link" data-page="settings"><span class="nav-icon">⚙</span> Settings</button>
+        </nav>
+        <div class="sidebar-bottom">
+          <div class="help-card"><div class="help-icon">?</div><strong>Need a hand?</strong><p>Visit our help center for guides and answers.</p><a href="#" id="help-link">Open help center <span>↗</span></a></div>
+          <div class="user-card"><span class="user-avatar" id="user-avatar">A</span><span><strong id="account-name">Account</strong><small id="account-label">Discord account</small></span><button id="sign-out" aria-label="Sign out">↗</button></div>
+        </div>
+      </aside>
+
+      <main class="main-content">
+        <header class="topbar"><div class="breadcrumbs"><span id="workspace-crumb">My workspace</span><span class="crumb-slash">/</span><strong id="breadcrumb-current">Overview</strong></div><div class="topbar-actions"><span class="demo-badge" id="session-badge"><span></span> DISCORD SIGN-IN</span><button class="icon-button notification-button" aria-label="Notifications">♧<i></i></button><button class="top-avatar" id="top-avatar" aria-label="Account">A</button></div></header>
+        <div id="account-mode-notice" class="notice account-mode-notice" hidden>Host provisioning is being configured. Plugin API linking is optional and available under Optional plugin API.</div>
+        <div id="page-content" class="page-content"></div>
+      </main>
+      <div id="toast" class="toast" role="status" aria-live="polite"></div>
+      <div id="modal-root"></div>
+    </div>
+    <script src="app.js?v=4"></script>
+  </body>
+</html>
