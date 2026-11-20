@@ -32,6 +32,20 @@ let activePage = "overview";
 let currentUser = null;
 let toastTimer;
 let adminPlans = [];
+let hostedServers = [];
+let hostedServersLoaded = false;
+let hostedServersLoading = false;
+let hostedLoadGeneration = 0;
+let hostedServersError = "";
+let selectedHostedServerId = null;
+let consoleTimer;
+let consoleGeneration = 0;
+let metricsTimer;
+let sftpTimer;
+let sftpRenewalGeneration = 0;
+let currentDirectory = "/";
+let currentFiles = [];
+let activeEditor = null;
 
 const pageTitles = {
   overview: "Overview",
@@ -139,10 +153,242 @@ function activityItems() {
   return state.activity.slice(0, 5).map((item) => `<div class="activity-item"><span class="activity-icon ${item.tone}">${item.icon}</span><div class="activity-copy">${item.text}<time>${esc(item.time)}</time></div></div>`).join("");
 }
 
+function hostedPicker() {
+  if (!hostedServers.some((server) => server.id === selectedHostedServerId)) selectedHostedServerId = hostedServers[0]?.id || null;
+  return `<select class="select-field" id="hosted-page-server" aria-label="Choose managed server">${hostedServers.map((server) => `<option value="${esc(server.id)}" ${server.id === selectedHostedServerId ? "selected" : ""}>${esc(server.name)}</option>`).join("")}</select>`;
+}
+
+function liveContext(generation, page) {
+  return generation === consoleGeneration && currentUser && !currentUser.demo && activePage === page;
+}
+
+async function managementApi(suffix, options = {}, serverId = selectedHostedServerId) {
+  const binary = options.body instanceof Blob;
+  const response = await fetch(`/api/hosted/servers/${encodeURIComponent(serverId)}${suffix}`, {
+    credentials: "same-origin", signal: AbortSignal.timeout(binary ? 120000 : 30000), ...options,
+    headers: { "X-Blockhost-Request": "console", ...(options.body === undefined ? {} : { "Content-Type": binary ? "application/octet-stream" : "application/json" }), ...options.headers },
+    ...(options.body === undefined ? {} : { body: binary ? options.body : JSON.stringify(options.body) }),
+  });
+  if (!response.headers.get("Content-Type")?.includes("application/json")) throw new Error(`Unexpected management response (HTTP ${response.status}).`);
+  const result = await response.json();
+  if (!response.ok) {
+    const error = new Error(result.error || `Management request failed (${response.status}).`);
+    error.status = response.status;
+    throw error;
+  }
+  return { ...result, etag: response.headers.get("ETag") };
+}
+
+function liveError(error, elementId) {
+  console.error("Hosted management operation failed:", error);
+  const element = document.getElementById(elementId);
+  if (element) { element.textContent = error.message; element.hidden = false; }
+  showToast(error.message);
+}
+
+function bytesLabel(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
+  return `${(bytes / 1024 ** 3).toFixed(2)} GiB`;
+}
+
+async function pollHostedMetrics(generation) {
+  await Promise.all(hostedServers.map(async (server) => {
+    try {
+      const metrics = await managementApi("/metrics", {}, server.id);
+      if (generation !== consoleGeneration || !["overview", "servers"].includes(activePage) || !currentUser || currentUser.demo) return;
+      const element = document.getElementById(`live-metrics-${server.id}`);
+      if (!element) return;
+      const hours = Math.floor(metrics.uptimeSeconds / 3600);
+      const minutes = Math.floor(metrics.uptimeSeconds % 3600 / 60);
+      element.innerHTML = `<span>CPU: <strong>${metrics.cpuPercent === null ? "Sampling..." : `${esc(metrics.cpuPercent.toFixed(1))}%`}</strong></span><span>Minecraft RAM: <strong>${esc(bytesLabel(metrics.memoryBytes))}</strong> / ${esc(server.ramMb / 1024)} GiB</span><span>VM disk: <strong>${esc(bytesLabel(metrics.disk.usedBytes))}</strong> / ${esc(bytesLabel(metrics.disk.totalBytes))}</span><span>Players: <strong>${metrics.players ? `${esc(metrics.players.online)} / ${esc(metrics.players.max)}` : metrics.state === "active" ? "Unavailable" : "Offline"}</strong></span><span>Uptime: <strong>${esc(hours)}h ${esc(minutes)}m</strong></span>${metrics.playersError ? `<span class="muted">${esc(metrics.playersError)}</span>` : ""}`;
+      server.state = metrics.state;
+      const status = document.getElementById(`live-server-state-${server.id}`);
+      if (status) { status.innerHTML = `<i></i>${esc(metrics.state === "active" ? "Online" : metrics.state)}`; status.classList.toggle("offline", metrics.state !== "active"); }
+    } catch (error) {
+      if (generation !== consoleGeneration) return;
+      console.error("Hosted metrics failed:", server.id, error);
+      const element = document.getElementById(`live-metrics-${server.id}`);
+      if (element) element.textContent = `Live metrics unavailable: ${error.message}`;
+    }
+  }));
+  if (generation === consoleGeneration && ["overview", "servers"].includes(activePage) && currentUser && !currentUser.demo) metricsTimer = window.setTimeout(() => pollHostedMetrics(generation), 5000);
+}
+
+async function loadLiveFiles(generation) {
+  const id = selectedHostedServerId;
+  const directory = currentDirectory;
+  try {
+    const result = await managementApi(`/files?path=${encodeURIComponent(directory)}`, {}, id);
+    if (!liveContext(generation, "files") || selectedHostedServerId !== id || currentDirectory !== directory) return;
+    currentFiles = result.entries;
+    document.getElementById("live-directory").textContent = directory;
+    document.getElementById("files-error").hidden = true;
+    document.getElementById("live-file-rows").innerHTML = currentFiles.map((file) => {
+      const filename = `${directory === "/" ? "" : directory}/${file.name}`;
+      return `<tr><td class="file-name">${file.type === "directory" ? `<button class="text-link" data-action="live-directory" data-path="${esc(filename)}">${esc(file.name)}/</button>` : esc(file.name)}</td><td>${file.type === "file" ? esc(bytesLabel(file.size)) : esc(file.type)}</td><td>${esc(new Date(file.modified).toLocaleString())}</td><td><div class="heading-actions">${file.type === "file" ? `<a class="text-link" href="/api/hosted/servers/${encodeURIComponent(id)}/files/content?path=${encodeURIComponent(filename)}" download>Download</a>${file.size <= 256 * 1024 ? `<button class="text-link" data-action="live-file-edit" data-path="${esc(filename)}">Edit</button>` : ""}` : ""}${["file", "directory"].includes(file.type) ? `<button class="text-link" data-action="live-file-rename" data-path="${esc(filename)}">Rename</button><button class="text-link" data-action="live-file-delete" data-path="${esc(filename)}">Delete</button>` : ""}</div></td></tr>`;
+    }).join("") || `<tr><td colspan="4" class="muted">This folder is empty.</td></tr>`;
+  } catch (error) { if (liveContext(generation, "files")) liveError(error, "files-error"); }
+}
+
+async function liveFileOperation(operation, source, destination) {
+  const generation = consoleGeneration;
+  const id = selectedHostedServerId;
+  try {
+    await managementApi("/files", { method: "POST", body: { operation, path: source, destination } }, id);
+    if (liveContext(generation, "files")) { showToast("File operation completed."); await loadLiveFiles(generation); }
+  } catch (error) { if (liveContext(generation, "files")) liveError(error, "files-error"); }
+}
+
+async function openLiveEditor(filename) {
+  const generation = consoleGeneration;
+  const id = selectedHostedServerId;
+  try {
+    const result = await managementApi(`/files/content?edit=1&path=${encodeURIComponent(filename)}`, {}, id);
+    if (!liveContext(generation, "files")) return;
+    activeEditor = { filename, id, revision: result.etag };
+    document.getElementById("live-editor-content").value = result.content;
+    document.getElementById("live-editor-title").textContent = filename;
+    document.getElementById("live-file-editor").hidden = false;
+  } catch (error) { if (liveContext(generation, "files")) liveError(error, "files-error"); }
+}
+
+async function saveLiveEditor(button) {
+  const editor = activeEditor;
+  if (!editor) return;
+  const generation = consoleGeneration;
+  const input = document.getElementById("live-editor-content");
+  button.disabled = true;
+  input.disabled = true;
+  try {
+    await managementApi(`/files/content?edit=1&path=${encodeURIComponent(editor.filename)}`, {
+      method: "PUT", headers: { "If-Match": editor.revision }, body: new Blob([input.value], { type: "application/octet-stream" }),
+    }, editor.id);
+    if (liveContext(generation, "files")) { showToast("File saved."); await openLiveEditor(editor.filename); await loadLiveFiles(generation); }
+  } catch (error) { if (liveContext(generation, "files")) liveError(error, "files-error"); }
+  finally { button.disabled = false; input.disabled = false; }
+}
+
+async function uploadLiveFiles(list) {
+  const files = Array.from(list);
+  if (!files.length) return;
+  if (files.length > 20) { showToast("Upload at most 20 files at a time, or use SFTP."); return; }
+  const generation = consoleGeneration;
+  const id = selectedHostedServerId;
+  const directory = currentDirectory;
+  try {
+    for (const file of files) {
+      if (!liveContext(generation, "files")) break;
+      if (file.size > 90 * 1024 * 1024) throw new Error(`${file.name} exceeds 90 MiB. Use SFTP for larger files.`);
+      const overwrite = currentFiles.some((entry) => entry.name === file.name);
+      if (overwrite && !window.confirm(`Overwrite ${file.name}?`)) continue;
+      const filename = `${directory === "/" ? "" : directory}/${file.name}`;
+      showToast(`Uploading ${file.name}...`);
+      await managementApi(`/files/content?path=${encodeURIComponent(filename)}`, { method: "PUT", body: file, headers: { "X-Blockhost-Overwrite": String(overwrite) } }, id);
+      showToast(`${file.name} uploaded.`);
+    }
+  } catch (error) { if (liveContext(generation, "files")) liveError(error, "files-error"); }
+  finally { if (liveContext(generation, "files")) await loadLiveFiles(generation); }
+}
+
+function displaySftpLease(result) {
+  const element = document.getElementById("live-sftp-lease");
+  element.dataset.expiresAt = result.expiresAt || "";
+  element.textContent = result.expiresAt
+    ? `IP ${result.ip} authorized until ${new Date(result.expiresAt).toLocaleTimeString()}. Auto-renewal is active while this page stays open.`
+    : `External SFTP is not enabled for this session's current IP (${result.ip}).`;
+}
+
+function scheduleSftpRenewal(generation) {
+  const renewalGeneration = ++sftpRenewalGeneration;
+  window.clearTimeout(sftpTimer);
+  sftpTimer = window.setTimeout(async () => {
+    if (!liveContext(generation, "files")) return;
+    try {
+      const result = await managementApi("/sftp/access", { method: "POST", body: { enabled: true, renew: true } });
+      if (liveContext(generation, "files") && renewalGeneration === sftpRenewalGeneration) { displaySftpLease(result); scheduleSftpRenewal(generation); }
+    } catch (error) {
+      if (liveContext(generation, "files") && renewalGeneration === sftpRenewalGeneration) {
+        const element = document.getElementById("live-sftp-lease");
+        element.textContent = `Automatic renewal stopped. Previous grant expires ${element.dataset.expiresAt ? new Date(element.dataset.expiresAt).toLocaleTimeString() : "unless renewed"}.`;
+        liveError(new Error(`SFTP renewal failed: ${error.message}. Enable access again before it expires.`), "files-error");
+      }
+    }
+  }, 5 * 60 * 1000);
+}
+
+async function loadLiveSftp(generation) {
+  try {
+    const result = await managementApi("/sftp");
+    if (!liveContext(generation, "files")) return;
+    document.getElementById("live-sftp-details").textContent = `Host: ${result.host}    Port: ${result.port}    Username: ${result.username}\nHost key: ${result.hostKeyFingerprint}\nCurrent website IP: ${result.ip}`;
+    document.getElementById("live-sftp-keys").value = result.publicKeys.join("\n");
+    document.querySelectorAll("[data-action^=live-sftp-]").forEach((button) => { button.disabled = false; });
+    displaySftpLease(result);
+    if (result.expiresAt) scheduleSftpRenewal(generation);
+  } catch (error) { if (liveContext(generation, "files")) liveError(error, "files-error"); }
+}
+
+async function changeSftp(action, button) {
+  const generation = consoleGeneration;
+  sftpRenewalGeneration++;
+  window.clearTimeout(sftpTimer);
+  button.disabled = true;
+  try {
+    if (action === "live-sftp-keys") {
+      const keys = document.getElementById("live-sftp-keys").value.split("\n").map((key) => key.trim()).filter(Boolean);
+      if (keys.some((key) => !key.startsWith("ssh-ed25519 "))) throw new Error("Paste Ed25519 public keys only, never private keys.");
+      if (!keys.length && !window.confirm("Remove all external SFTP keys and disconnect existing SFTP sessions?")) return;
+      await managementApi("/sftp/keys", { method: "POST", body: { publicKeys: keys } });
+      showToast("SFTP public keys saved.");
+    } else {
+      await managementApi("/sftp/access", { method: "POST", body: { enabled: action === "live-sftp-enable" } });
+      window.clearTimeout(sftpTimer);
+    }
+    if (liveContext(generation, "files")) await loadLiveSftp(generation);
+  } catch (error) { if (liveContext(generation, "files")) liveError(error, "files-error"); }
+  finally { button.disabled = false; }
+}
+
+async function loadLiveSettings(generation) {
+  try {
+    const result = await managementApi("/settings");
+    if (!liveContext(generation, "settings")) return;
+    const settings = result.settings;
+    const editable = ["inactive", "failed"].includes(result.state);
+    document.getElementById("live-settings-state").textContent = `Minecraft: ${result.state}`;
+    const form = document.getElementById("live-settings-form");
+    form.dataset.revision = result.sha256;
+    const number = (name, label, min, max) => `<div class="settings-field"><label for="setting-${name}">${label}</label><input id="setting-${name}" class="form-control" name="${name}" type="number" min="${min}" max="${max}" value="${esc(settings[name])}" required></div>`;
+    const select = (name, values) => `<div class="settings-field"><label for="setting-${name}">${esc(name)}</label><select class="form-control" name="${name}" id="setting-${name}">${values.map((value) => `<option ${settings[name] === value ? "selected" : ""}>${esc(value)}</option>`).join("")}</select></div>`;
+    form.innerHTML = `<fieldset class="live-settings-fields" ${editable ? "" : "disabled"}>
+      <div class="settings-field"><label for="setting-motd">Server description</label><input id="setting-motd" class="form-control" name="motd" maxlength="120" value="${esc(settings.motd)}"></div>
+      ${number("maxPlayers", "Maximum players", 1, 100)}${select("gamemode", ["survival", "creative", "adventure", "spectator"])}${select("difficulty", ["peaceful", "easy", "normal", "hard"])}
+      ${number("viewDistance", "View distance", 2, 24)}${number("simulationDistance", "Simulation distance", 2, 24)}${number("spawnProtection", "Spawn protection", 0, 256)}
+      ${[["whitelist", "Enable whitelist"], ["allowFlight", "Allow flight"]].map(([name, label]) => `<div class="settings-field"><label for="setting-${name}">${label}</label><input type="checkbox" name="${name}" id="setting-${name}" ${settings[name] ? "checked" : ""}></div>`).join("")}
+      <div class="modal-actions"><button type="submit" class="button button-primary button-small">Save settings</button></div></fieldset>`;
+  } catch (error) { if (liveContext(generation, "settings")) liveError(error, "settings-error"); }
+}
+
+async function saveLiveSettings(form) {
+  const generation = consoleGeneration;
+  const data = new FormData(form);
+  const settings = { motd: data.get("motd"), gamemode: data.get("gamemode"), difficulty: data.get("difficulty"), whitelist: data.has("whitelist"), allowFlight: data.has("allowFlight") };
+  for (const name of ["maxPlayers", "viewDistance", "simulationDistance", "spawnProtection"]) settings[name] = Number(data.get(name));
+  form.querySelector("fieldset").disabled = true;
+  try {
+    await managementApi("/settings", { method: "POST", body: { settings, expectedSha256: form.dataset.revision } });
+    if (liveContext(generation, "settings")) { showToast("Settings saved. Start Minecraft to apply them."); await loadLiveSettings(generation); }
+  } catch (error) {
+    if (liveContext(generation, "settings")) { liveError(error, "settings-error"); form.querySelector("fieldset").disabled = false; }
+  }
+}
+
 function renderOverview() {
   if (currentUser && !currentUser.demo) {
     return `${pageHeading(`Welcome, ${esc(currentUser.username)}`, "Create and manage your hosted Minecraft servers.", `<button class="button button-primary button-small" data-action="create-server"><span class="plus">+</span> Create server</button>`)}
-      <section class="panel"><div class="panel-heading"><div><h2>Your servers</h2><p>Live status for your hosted Minecraft servers</p></div><button class="text-link" data-page="servers">View all →</button></div><div class="empty-state"><strong>No hosted servers yet</strong>Create a server to get started. The optional plugin API is available separately.</div></section>`;
+      <section class="panel"><div class="panel-heading"><div><h2>Your servers</h2><p>Your managed servers and console access</p></div><button class="text-link" data-page="servers">View all →</button></div>${renderHostedServers()}</section>`;
   }
   const online = state.servers.filter((server) => server.status === "online").length;
   const players = state.servers.reduce((sum, server) => sum + (server.status === "online" ? server.players : 0), 0);
@@ -162,8 +408,8 @@ function renderOverview() {
 
 function renderServers() {
   if (currentUser && !currentUser.demo) {
-    return `${pageHeading("Your servers", "Create, configure, and monitor your Minecraft servers.", `<button class="button button-primary button-small" data-action="create-server"><span class="plus">+</span> Create server</button>`)}
-      <section class="panel"><div class="empty-state"><strong>No hosted servers yet</strong>Create a server to see its status and settings here.</div></section>`;
+    return `${pageHeading("Your servers", "Create, configure, and monitor your Minecraft servers.", `<button class="button button-dark button-small" data-action="refresh-hosted-servers">Refresh</button><button class="button button-primary button-small" data-action="create-server"><span class="plus">+</span> Create server</button>`)}
+      ${renderHostedServers()}`;
   }
   return `${pageHeading("Your servers", "Create, configure, and monitor all of your Minecraft worlds.", `<button class="button button-primary button-small" data-action="create-server"><span class="plus">+</span> Create server</button>`)}
     <div class="notice"><strong>Demo mode:</strong> Server actions update this dashboard only. Connect a hosting provider to provision and control live Minecraft servers.</div>
@@ -180,8 +426,18 @@ function fileIcon(type) {
 
 function renderFiles() {
   if (currentUser && !currentUser.demo) {
-    return `${pageHeading("File manager", "Browse server files and world saves.")}
-      <section class="panel"><div class="empty-state"><strong>File management is not connected</strong>No server files are shown until a file-transfer integration is available.</div></section>`;
+    if (!hostedServersLoaded || !hostedServers.length) return `${pageHeading("File manager", "Files are restricted to your assigned Minecraft server.")}${renderHostedServers()}`;
+    return `${pageHeading("File manager", "Browser transfers use the same isolated storage as SFTP.", hostedPicker())}
+      <div class="notice">Stop Minecraft before modifying worlds or core configuration. Browser uploads: 90 MiB per file; text editing: 256 KiB. Use SFTP for larger files. Folder deletion is empty-only.</div>
+      <div class="notice" id="files-error" role="alert" hidden></div>
+      <section class="panel"><div class="panel-heading"><div><h2>Server files</h2><p id="live-directory">/</p></div><div class="heading-actions"><button class="text-link" data-action="live-folder">New folder</button><button class="text-link" data-action="live-files-refresh">Refresh</button><label class="button button-dark button-small">Upload<input id="live-file-upload" type="file" multiple hidden></label></div></div>
+        <div class="toolbar live-file-toolbar"><button class="text-link" data-action="live-directory-up">Parent folder</button></div>
+        <div class="table-wrap"><table class="data-table"><thead><tr><th>NAME</th><th>SIZE</th><th>MODIFIED</th><th>ACTIONS</th></tr></thead><tbody id="live-file-rows"><tr><td colspan="4">Loading files...</td></tr></tbody></table></div>
+      </section>
+      <section class="panel settings-content section-spacer" id="live-file-editor" hidden><h2 id="live-editor-title">Edit file</h2><textarea id="live-editor-content" class="live-textarea" spellcheck="false" aria-label="Server file contents"></textarea><div class="modal-actions"><button class="button button-dark button-small" data-action="live-editor-close">Close</button><button class="button button-primary button-small" data-action="live-editor-save">Save file</button></div></section>
+      <section class="panel settings-content section-spacer"><h2>External SFTP access</h2><p>SSH keys are required. Only your currently authorized website IP can connect; grants last one hour and renew while this page stays open.</p><div id="live-sftp-details">Loading SFTP settings...</div>
+        <label for="live-sftp-keys">Ed25519 public keys (one per line, up to five; never paste private keys)</label><textarea id="live-sftp-keys" class="live-textarea key-textarea" spellcheck="false"></textarea><div class="modal-actions"><button class="button button-dark button-small" data-action="live-sftp-keys" disabled>Save public keys</button><button class="button button-dark button-small" data-action="live-sftp-disable" disabled>Revoke this session</button><button class="button button-primary button-small" data-action="live-sftp-enable" disabled>Enable SFTP for this IP</button></div><p id="live-sftp-lease" role="status"></p><div class="notice">Your SFTP client must use the same source IP as this website connection. VPN changes, IPv4/IPv6 differences, or router hairpin NAT can change it. Other accounts sharing your IP still need their own authorized SSH keys. Revoking your grant may interrupt transfers.</div>
+      </section>`;
   }
   return `${pageHeading("File manager", "Manage server files, plugins, and world saves.", `<button class="button button-dark button-small" data-action="upload-world">↑ &nbsp;Upload world</button><button class="button button-primary button-small" data-action="upload-jar">↑ &nbsp;Upload .jar</button>`)}
     <div class="notice"><strong>Demo file manager:</strong> Uploads are listed locally in this browser only. Connect a server backend for real file transfer.</div>
@@ -198,8 +454,18 @@ function fileTableRows(files) {
 
 function renderConsole() {
   if (currentUser && !currentUser.demo) {
-    return `${pageHeading("Server console", "View output and send commands to a connected server.")}
-      <section class="panel"><div class="empty-state"><strong>Hosted server console is being configured</strong>Console access will be connected to the managed server process, independently of the optional plugin API.</div></section>`;
+    if (!hostedServersLoaded || !hostedServers.length) {
+      return `${pageHeading("Server console", "View output and send Minecraft commands.")}${renderHostedServers()}`;
+    }
+    if (!hostedServers.some((server) => server.id === selectedHostedServerId)) selectedHostedServerId = hostedServers[0].id;
+    return `${pageHeading("Server console", "Commands run in Minecraft, not in an operating-system shell.", `<select class="select-field" id="hosted-console-server" aria-label="Choose console server">${hostedServers.map((server) => `<option value="${esc(server.id)}" ${server.id === selectedHostedServerId ? "selected" : ""}>${esc(server.name)}</option>`).join("")}</select>`)}
+      <div class="notice">Live output refreshes every 2.5 seconds and shows the latest 200 lines. Commands have full Minecraft console permissions.</div>
+      <section class="console-window">
+        <div class="console-toolbar"><span id="console-service-state">Connecting...</span><span class="console-power-actions"><button class="text-link" data-action="hosted-power" data-power="start">Start</button><button class="text-link" data-action="hosted-power" data-power="stop">Stop</button><button class="text-link" data-action="hosted-power" data-power="restart">Restart</button></span></div>
+        <div class="notice console-error" id="console-error" role="alert" hidden></div>
+        <pre class="console-output live-console-output" id="console-output">Loading server output...</pre>
+        <form class="console-input-row" id="console-form"><input id="console-command" maxlength="512" autocomplete="off" aria-label="Minecraft console command" placeholder="Enter a command (e.g. list, say Hello)"><button type="submit">Send command ↗</button></form>
+      </section>`;
   }
   return `${pageHeading("Server console", "View server output and send commands.", `<select class="select-field" id="console-server">${state.servers.map((server) => `<option value="${esc(server.id)}">${esc(server.name)}</option>`).join("")}</select>`)}
     <div class="notice"><strong>Demo console:</strong> Commands are not sent to a live Minecraft server.</div>
@@ -212,6 +478,105 @@ function renderConsole() {
       <div class="console-line"><span class="time">[10:42:08]</span> <span class="tag">[Server thread/INFO]</span>: Done (3.842s)! For help, type "help"</div>
       <div class="console-line"><span class="time">[10:42:08]</span> <span class="tag">[Server thread/INFO]</span>: There are 12 of a max of 40 players online</div>
     </div><form class="console-input-row" id="console-form"><input id="console-command" autocomplete="off" placeholder="Enter a command (e.g. list, say Hello)"><button type="submit">Send command ↗</button></form></section>`;
+}
+
+function renderHostedServers() {
+  if (!hostedServersLoaded) return `<div class="empty-state"><strong>Loading your servers...</strong></div>`;
+  if (hostedServersError) return `<div class="empty-state"><strong>Could not load hosted servers</strong>${esc(hostedServersError)} <button class="text-link" data-action="refresh-hosted-servers">Retry</button></div>`;
+  if (!hostedServers.length) return `<div class="empty-state"><strong>No hosted servers yet</strong>Managed servers assigned to your account will appear here.</div>`;
+  return `<div class="servers-grid hosted-server-grid">${hostedServers.map((server) => `<article class="server-card">
+    <div class="server-card-top"><div class="server-name"><span class="server-glyph">▦</span><span><strong>${esc(server.name)}</strong><small>${esc(server.software)} ${esc(server.version)} · VM ${esc(server.vmid)}</small></span></div><span id="live-server-state-${esc(server.id)}" class="server-status ${server.state === "active" ? "" : "offline"}"><i></i>${esc(server.state === "active" ? "Online" : server.state || "Not checked")}</span></div>
+    <div class="server-card-body"><div><div class="stat-label">VCPU</div><div class="stat-value">${esc(server.vcpus)}</div></div><div><div class="stat-label">MEMORY</div><div class="stat-value">${esc(server.ramMb / 1024)}<small>GiB</small></div></div><div><div class="stat-label">DISK</div><div class="stat-value">${esc(server.diskGb)}<small>GiB</small></div></div></div>
+    ${server.error ? `<div class="notice">${esc(server.error)}</div>` : ""}
+    <div class="hosted-live-metrics" id="live-metrics-${esc(server.id)}">Loading measured usage...</div>
+    <div class="server-card-bottom"><span class="server-address">${esc(server.address)}</span><div class="heading-actions"><button class="text-link" data-action="hosted-files" data-id="${esc(server.id)}">Files / SFTP</button><button class="text-link" data-action="hosted-settings" data-id="${esc(server.id)}">Settings</button><button class="button button-primary button-small" data-action="hosted-console" data-id="${esc(server.id)}">Open console</button></div></div>
+  </article>`).join("")}</div>`;
+}
+
+async function loadHostedServers() {
+  if (hostedServersLoading || !currentUser || currentUser.demo) return;
+  const accountId = currentUser.id;
+  const generation = ++hostedLoadGeneration;
+  hostedServersLoading = true;
+  hostedServersError = "";
+  try {
+    const response = await fetch("/api/hosted/servers", { credentials: "same-origin", signal: AbortSignal.timeout(10000) });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `Server lookup failed (${response.status}).`);
+    const servers = await Promise.all(result.map(async (server) => {
+      try {
+        const statusResponse = await fetch(`/api/hosted/servers/${encodeURIComponent(server.id)}/console`, { credentials: "same-origin", signal: AbortSignal.timeout(20000) });
+        const status = await statusResponse.json();
+        if (!statusResponse.ok) throw new Error(status.error || `Status lookup failed (${statusResponse.status}).`);
+        return { ...server, state: status.state };
+      } catch (error) {
+        console.error("Could not load hosted server status:", server.id, error);
+        return { ...server, state: "Unavailable", error: error.message };
+      }
+    }));
+    if (generation !== hostedLoadGeneration || currentUser?.id !== accountId || currentUser.demo) return;
+    hostedServers = servers;
+  } catch (error) {
+    console.error("Could not load hosted servers:", error);
+    if (generation !== hostedLoadGeneration || currentUser?.id !== accountId || currentUser.demo) return;
+    hostedServersError = error.message;
+    hostedServers = [];
+  } finally {
+    if (generation === hostedLoadGeneration) hostedServersLoading = false;
+    if (generation === hostedLoadGeneration && currentUser?.id === accountId && !currentUser.demo) {
+      hostedServersLoaded = true;
+      if (["overview", "servers", "console", "files", "settings"].includes(activePage)) renderPage();
+    }
+  }
+}
+
+async function pollHostedConsole(generation) {
+  const id = selectedHostedServerId;
+  try {
+    const response = await fetch(`/api/hosted/servers/${encodeURIComponent(id)}/console`, { credentials: "same-origin", signal: AbortSignal.timeout(20000) });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `Console lookup failed (${response.status}).`);
+    if (generation !== consoleGeneration || activePage !== "console" || currentUser?.demo) return;
+    const output = document.getElementById("console-output");
+    const scroll = output.scrollHeight - output.scrollTop - output.clientHeight < 50 || output.textContent === "Loading server output...";
+    output.textContent = result.output || "No output yet.";
+    if (scroll) output.scrollTop = output.scrollHeight;
+    document.getElementById("console-service-state").textContent = `Server: ${result.state}`;
+    document.getElementById("console-error").hidden = true;
+    const server = hostedServers.find((item) => item.id === id);
+    if (server) { server.state = result.state; delete server.error; }
+  } catch (error) {
+    if (generation !== consoleGeneration || activePage !== "console") return;
+    console.error("Could not read hosted console:", error);
+    const notice = document.getElementById("console-error");
+    notice.textContent = error.message;
+    notice.hidden = false;
+    document.getElementById("console-service-state").textContent = "Console unavailable";
+  } finally {
+    if (generation === consoleGeneration && activePage === "console" && currentUser && !currentUser.demo) {
+      window.clearTimeout(consoleTimer);
+      consoleTimer = window.setTimeout(() => pollHostedConsole(generation), 2500);
+    }
+  }
+}
+
+async function hostedPower(action, button) {
+  const id = selectedHostedServerId;
+  button.disabled = true;
+  try {
+    const response = await fetch(`/api/hosted/servers/${encodeURIComponent(id)}/power`, {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "X-Blockhost-Request": "console" },
+      body: JSON.stringify({ action }), signal: AbortSignal.timeout(150000),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `Power operation failed (${response.status}).`);
+    showToast(`Server ${action} request accepted.`);
+    if (activePage === "settings" && selectedHostedServerId === id) renderPage();
+  } catch (error) {
+    console.error("Hosted power operation failed:", error);
+    showToast(error.message);
+  } finally { button.disabled = false; }
 }
 
 function renderBackups() {
@@ -227,8 +592,11 @@ function renderBackups() {
 
 function renderSettings() {
   if (currentUser && !currentUser.demo) {
-    return `${pageHeading("Settings", "Account and workspace preferences.")}
-      <section class="panel"><div class="empty-state"><strong>Workspace settings are not available yet</strong>Signed in as ${esc(currentUser.username)}.</div></section>`;
+    if (!hostedServersLoaded || !hostedServers.length) return `${pageHeading("Server settings", "Manage your Minecraft configuration.")}${renderHostedServers()}`;
+    return `${pageHeading("Server settings", "Proxy authentication and network settings are protected by this editor.", hostedPicker())}
+      <div class="notice">Stop Minecraft before saving. Changes apply on the next start. Backups and restore are deferred.</div>
+      <div class="notice" id="settings-error" role="alert" hidden></div>
+      <section class="panel settings-content"><div class="console-power-actions"><span id="live-settings-state">Loading...</span><button class="text-link" data-action="hosted-power" data-power="stop">Stop server</button><button class="text-link" data-action="hosted-power" data-power="start">Start server</button><button class="text-link" data-action="live-settings-refresh">Reload settings</button></div><form id="live-settings-form">Loading server settings...</form></section>`;
   }
   return `${pageHeading("Settings", "Manage workspace preferences and account details.")}
     <div class="settings-grid"><section class="panel settings-nav"><button class="settings-tab active">General</button><button class="settings-tab" data-action="setting-info">Notifications</button><button class="settings-tab" data-action="setting-info">Security</button><button class="settings-tab" data-action="setting-info">Billing</button></section>
@@ -366,11 +734,25 @@ async function runMinecraftAction(id, action, payload) {
 }
 
 function renderPage() {
+  window.clearTimeout(consoleTimer);
+  window.clearTimeout(metricsTimer);
+  window.clearTimeout(sftpTimer);
+  activeEditor = null;
+  consoleGeneration++;
   const renderers = { overview: renderOverview, servers: renderServers, files: renderFiles, console: renderConsole, backups: renderBackups, settings: renderSettings, infrastructure: renderInfrastructure, minecraft: renderMinecraft, plans: renderPlans };
   document.getElementById("page-content").innerHTML = renderers[activePage]();
   const serverCount = document.getElementById("server-nav-count");
-  serverCount.textContent = String(state.servers.length);
-  serverCount.hidden = Boolean(currentUser && !currentUser.demo);
+  serverCount.textContent = String(currentUser && !currentUser.demo ? hostedServers.length : state.servers.length);
+  serverCount.hidden = false;
+  if (currentUser && !currentUser.demo && ["overview", "servers", "console", "files", "settings"].includes(activePage)) {
+    if (!hostedServersLoaded) loadHostedServers();
+    else if (activePage === "console" && hostedServers.length) pollHostedConsole(consoleGeneration);
+    if (hostedServersLoaded && hostedServers.length) {
+      if (activePage === "overview" || activePage === "servers") pollHostedMetrics(consoleGeneration);
+      if (activePage === "files") { loadLiveFiles(consoleGeneration); loadLiveSftp(consoleGeneration); }
+      if (activePage === "settings") loadLiveSettings(consoleGeneration);
+    }
+  }
   if (activePage === "infrastructure" && !currentUser?.demo) loadProxmoxStats();
   if (activePage === "plans" && currentUser?.isAdmin && !currentUser.demo) loadAdminPlans();
   if (activePage === "minecraft") {
@@ -425,6 +807,10 @@ function openModal({ title, subtitle, content, submitText = "Create server", can
       if (form.isConnected && !submitDisabled) submitButton.disabled = false;
     }
   });
+}
+
+function minecraftEulaConsentField() {
+  return `<div class="eula-consent"><input id="server-eula" name="eulaAccepted" type="checkbox" required><label for="server-eula">I have read and agree to the <a href="https://www.minecraft.net/en-us/eula" target="_blank" rel="noopener noreferrer">Minecraft EULA</a>.</label></div>`;
 }
 
 function closeModal() {
@@ -501,7 +887,7 @@ function createServerModal() {
     openModal({
       title: "Create a Minecraft server",
       subtitle: "Your assigned plan will set the limits for each server.",
-      content: `<div id="create-server-plan" class="modal-notice">Loading your plan…</div><div class="modal-notice">Automated VM provisioning is being configured. No server or public port will be created yet.</div>`,
+      content: `<div id="create-server-plan" class="modal-notice">Loading your plan…</div><div class="modal-notice">Automated VM provisioning is being configured. No server or public port will be created yet, and EULA consent is not recorded until a server can be created.</div>${minecraftEulaConsentField()}`,
       submitText: "Provisioning not ready",
       cancelText: "Close",
       submitDisabled: true,
@@ -529,10 +915,14 @@ function createServerModal() {
       <label for="server-software">Server software</label><select class="form-control" id="server-software" name="software"><option>Paper</option><option>Vanilla</option><option>Fabric</option><option>Forge</option><option>Purpur</option></select>
       <label for="server-version">Minecraft version</label><select class="form-control" id="server-version" name="version"><option>1.21.4</option><option>1.21.3</option><option>1.20.1</option><option>1.19.4</option></select>
       <label for="server-ram">Memory allocation</label><select class="form-control" id="server-ram" name="ram"><option value="2">2 GB</option><option value="4" selected>4 GB</option><option value="6">6 GB</option><option value="8">8 GB</option></select>
-      <div class="modal-notice">This creates a demo server entry. Live provisioning requires a connected hosting provider.</div>`,
+      ${minecraftEulaConsentField()}
+      <div class="modal-notice">This creates a demo dashboard entry only; no Minecraft server or EULA file is created.</div>`,
     onSubmit: (data) => {
       const name = String(data.get("name") || "").trim();
       if (!name) return;
+      if (data.get("eulaAccepted") !== "on") {
+        throw new Error("Accept the Minecraft EULA before creating a server.");
+      }
       state.servers.push({ id: `server-${Date.now()}`, name, software: String(data.get("software")), version: String(data.get("version")), address: `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "new-server"}.stonebridge.gg`, players: 0, maxPlayers: 20, ram: Number(data.get("ram")), status: "offline", cpu: 0 });
       saveState();
       closeModal();
@@ -593,11 +983,32 @@ function addFiles(fileList) {
   showToast(`${files.length} file${files.length === 1 ? "" : "s"} added to the demo file list.`);
 }
 
-function submitCommand() {
+async function submitCommand() {
   const input = document.getElementById("console-command");
   const output = document.getElementById("console-output");
   const command = input.value.trim();
   if (!command) return;
+  if (currentUser && !currentUser.demo) {
+    const id = selectedHostedServerId;
+    const button = document.querySelector("#console-form button");
+    input.disabled = true;
+    button.disabled = true;
+    try {
+      const response = await fetch(`/api/hosted/servers/${encodeURIComponent(id)}/commands`, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json", "X-Blockhost-Request": "console" },
+        body: JSON.stringify({ command }), signal: AbortSignal.timeout(20000),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || `Command failed (${response.status}).`);
+      input.value = "";
+      showToast("Command sent to Minecraft. Its output will appear in the console.");
+    } catch (error) {
+      console.error("Could not send console command:", error);
+      showToast(error.message);
+    } finally { input.disabled = false; button.disabled = false; }
+    return;
+  }
   const line = document.createElement("div");
   line.className = "console-line";
   line.innerHTML = `<span class="time">[${new Date().toLocaleTimeString([], { hour12: false })}]</span> <span class="tag">[Demo/INFO]</span>: <span class="command-text"></span>`;
@@ -608,6 +1019,12 @@ function submitCommand() {
 }
 
 document.getElementById("demo-login").addEventListener("click", () => {
+  window.clearTimeout(metricsTimer);
+  window.clearTimeout(sftpTimer);
+  hostedLoadGeneration++;
+  hostedServersLoading = false;
+  window.clearTimeout(consoleTimer);
+  consoleGeneration++;
   state = loadState();
   currentUser = { name: "Jordan Davis", isAdmin: true, demo: true };
   document.getElementById("login-screen").hidden = true;
@@ -639,6 +1056,15 @@ document.getElementById("sign-out").addEventListener("click", async () => {
     }
   }
   currentUser = null;
+  window.clearTimeout(metricsTimer);
+  window.clearTimeout(sftpTimer);
+  window.clearTimeout(consoleTimer);
+  consoleGeneration++;
+  hostedServers = [];
+  hostedLoadGeneration++;
+  hostedServersLoading = false;
+  hostedServersLoaded = false;
+  selectedHostedServerId = null;
   document.getElementById("admin-nav").hidden = true;
   document.getElementById("plans-nav").hidden = true;
   document.querySelectorAll(".admin-nav").forEach((item) => item.hidden = true);
@@ -661,6 +1087,8 @@ async function restoreDiscordSession() {
     const result = await response.json();
     if (!result.authenticated) return;
     currentUser = { ...result.user, demo: false };
+    hostedServersLoaded = false;
+    hostedServers = [];
     state = emptyLiveState();
     document.getElementById("login-screen").hidden = true;
     document.getElementById("app").hidden = false;
@@ -690,6 +1118,32 @@ document.addEventListener("click", (event) => {
   if (!control) return;
   const { action, id } = control.dataset;
   if (action === "create-server") createServerModal();
+  else if (action === "hosted-console") { selectedHostedServerId = id; setPage("console"); }
+  else if (action === "hosted-files") { selectedHostedServerId = id; currentDirectory = "/"; setPage("files"); }
+  else if (action === "hosted-settings") { selectedHostedServerId = id; setPage("settings"); }
+  else if (action === "hosted-power") hostedPower(control.dataset.power, control);
+  else if (action === "refresh-hosted-servers") { hostedServersLoaded = false; hostedServersError = ""; renderPage(); }
+  else if (action === "live-directory") { currentDirectory = control.dataset.path; loadLiveFiles(consoleGeneration); }
+  else if (action === "live-directory-up") { currentDirectory = currentDirectory.split("/").slice(0, -1).join("/") || "/"; loadLiveFiles(consoleGeneration); }
+  else if (action === "live-files-refresh") loadLiveFiles(consoleGeneration);
+  else if (action === "live-folder") {
+    const name = window.prompt("New folder name (inside the current folder):");
+    if (name && !/[\\/\x00-\x1f]/.test(name) && name !== "." && name !== "..") liveFileOperation("mkdir", `${currentDirectory === "/" ? "" : currentDirectory}/${name}`);
+    else if (name) showToast("Enter a folder name without slashes or control characters.");
+  }
+  else if (action === "live-file-edit") openLiveEditor(control.dataset.path);
+  else if (action === "live-file-delete") {
+    if (window.confirm(`Delete ${control.dataset.path}? Folders must be empty. This cannot be undone.`)) liveFileOperation("delete", control.dataset.path);
+  }
+  else if (action === "live-file-rename") {
+    const name = window.prompt("New name (inside the same folder):", control.dataset.path.split("/").pop());
+    if (name && !/[\\/\x00-\x1f]/.test(name) && name !== "." && name !== "..") liveFileOperation("rename", control.dataset.path, control.dataset.path.split("/").slice(0, -1).join("/") + "/" + name);
+    else if (name) showToast("Enter a name without slashes or control characters.");
+  }
+  else if (action === "live-editor-close") { document.getElementById("live-file-editor").hidden = true; activeEditor = null; }
+  else if (action === "live-editor-save") saveLiveEditor(control);
+  else if (action.startsWith("live-sftp-")) changeSftp(action, control);
+  else if (action === "live-settings-refresh") loadLiveSettings(consoleGeneration);
   else if (action === "create-plan") editPlanModal();
   else if (action === "edit-plan") editPlanModal(adminPlans.find((plan) => plan.id === id));
   else if (action === "upload-jar") uploadModal("jar");
@@ -735,6 +1189,10 @@ document.addEventListener("click", (event) => {
 });
 
 document.addEventListener("submit", (event) => {
+  if (event.target.id === "live-settings-form") {
+    event.preventDefault();
+    saveLiveSettings(event.target);
+  }
   if (event.target.id === "minecraft-connect-form") {
     event.preventDefault();
     const form = event.target;
@@ -775,6 +1233,19 @@ document.addEventListener("input", (event) => {
 });
 
 document.addEventListener("change", (event) => {
+  if (event.target.id === "hosted-page-server") {
+    selectedHostedServerId = event.target.value;
+    currentDirectory = "/";
+    renderPage();
+  }
+  if (event.target.id === "live-file-upload") {
+    uploadLiveFiles(event.target.files);
+    event.target.value = "";
+  }
+  if (event.target.id === "hosted-console-server") {
+    selectedHostedServerId = event.target.value;
+    renderPage();
+  }
   if (event.target.id === "file-upload") addFiles(event.target.files);
   if (event.target.matches("[data-account-plan]")) {
     assignAccountPlan(event.target.dataset.accountPlan, event.target.value);
