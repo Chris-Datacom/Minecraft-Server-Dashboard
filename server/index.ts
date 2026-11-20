@@ -9,6 +9,8 @@ import { Strategy as DiscordStrategy } from "passport-discord";
 import { Pool } from "pg";
 import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from "crypto";
 import path from "path";
+import { createHostedServersRouter } from "./hosted-servers";
+import { createHostingManagement } from "./hosting-management";
 
 interface DiscordAccount extends Express.User {
   id: string;
@@ -186,15 +188,18 @@ app.get(
   passport.authenticate("discord", { failureRedirect: "/?auth=failed" }),
   (_req, res) => res.redirect("/"),
 );
-app.post("/auth/logout", requireAuthenticated, (req, res, next) => {
-  req.logout((logoutError) => {
-    if (logoutError) return next(logoutError);
-    req.session.destroy((sessionError) => {
-      if (sessionError) return next(sessionError);
-      res.clearCookie("blockhost.sid", { httpOnly: true, sameSite: "lax", secure: production });
-      res.status(204).end();
+app.post("/auth/logout", requireAuthenticated, async (req, res, next) => {
+  try {
+    await hostingManagement.revokeSession(req.sessionID);
+    req.logout((logoutError) => {
+      if (logoutError) return next(logoutError);
+      req.session.destroy((sessionError) => {
+        if (sessionError) return next(sessionError);
+        res.clearCookie("blockhost.sid", { httpOnly: true, sameSite: "lax", secure: production });
+        res.status(204).end();
+      });
     });
-  });
+  } catch (error) { next(error); }
 });
 
 app.get("/api/me", async (req, res, next) => {
@@ -492,6 +497,21 @@ function decryptApiKey(value: string, key: Buffer): string {
   ]).toString("utf8");
 }
 
+function decryptHostedKey(value: string): string {
+  if (!serverCredentialsKey) throw new Error("Server credentials are not configured.");
+  return decryptApiKey(value, Buffer.from(serverCredentialsKey, "hex"));
+}
+const hostingManagement = createHostingManagement(pool, decryptHostedKey);
+app.use("/api/hosted/servers", createHostedServersRouter({
+  database: pool,
+  requireAuthenticated,
+  adminIds: adminDiscordIds,
+  allowedHosts: new Set((process.env.HOSTED_SERVER_ALLOWED_HOSTS ?? "").split(",").map((value) => value.trim()).filter(Boolean)),
+  credentialsConfigured: Boolean(serverCredentialsKey),
+  decryptPrivateKey: decryptHostedKey,
+  management: hostingManagement.router,
+}));
+
 function validServerApiUrl(value: unknown): URL | null {
   if (typeof value !== "string" || value.length > 255) return null;
   try {
@@ -746,8 +766,38 @@ pool
         last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS hosted_servers (
+        id TEXT PRIMARY KEY,
+        owner_discord_id TEXT NOT NULL REFERENCES discord_accounts(discord_id),
+        name TEXT NOT NULL,
+        software TEXT NOT NULL,
+        version TEXT NOT NULL,
+        address TEXT NOT NULL UNIQUE,
+        vmid INTEGER NOT NULL UNIQUE,
+        vcpus INTEGER NOT NULL CHECK (vcpus > 0),
+        ram_mb INTEGER NOT NULL CHECK (ram_mb > 0),
+        disk_gb INTEGER NOT NULL CHECK (disk_gb > 0),
+        ssh_host TEXT NOT NULL,
+        ssh_host_fingerprint TEXT NOT NULL,
+        encrypted_ssh_key TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS sftp_access_grants (
+        server_id TEXT NOT NULL REFERENCES hosted_servers(id) ON DELETE CASCADE,
+        session_hash TEXT NOT NULL,
+        owner_discord_id TEXT NOT NULL REFERENCES discord_accounts(discord_id) ON DELETE CASCADE,
+        ip TEXT NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY (server_id, session_hash)
+      )
+    `);
+    await pool.query("CREATE INDEX IF NOT EXISTS sftp_access_expiry_idx ON sftp_access_grants(expires_at)");
   })
   .then(() => {
+    hostingManagement.start();
     app.listen(port, host, () => console.log(`Blockhost server listening on ${host}:${port}.`));
   })
   .catch((error: unknown) => {
