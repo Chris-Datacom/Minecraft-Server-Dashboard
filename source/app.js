@@ -46,6 +46,8 @@ let sftpRenewalGeneration = 0;
 let currentDirectory = "/";
 let currentFiles = [];
 let activeEditor = null;
+let provisioningTimer;
+const completedCreationJobs = new Set();
 
 const pageTitles = {
   overview: "Overview",
@@ -481,16 +483,39 @@ function renderConsole() {
 }
 
 function renderHostedServers() {
-  if (!hostedServersLoaded) return `<div class="empty-state"><strong>Loading your servers...</strong></div>`;
-  if (hostedServersError) return `<div class="empty-state"><strong>Could not load hosted servers</strong>${esc(hostedServersError)} <button class="text-link" data-action="refresh-hosted-servers">Retry</button></div>`;
-  if (!hostedServers.length) return `<div class="empty-state"><strong>No hosted servers yet</strong>Managed servers assigned to your account will appear here.</div>`;
-  return `<div class="servers-grid hosted-server-grid">${hostedServers.map((server) => `<article class="server-card">
+  const jobs = ["overview", "servers"].includes(activePage) ? `<div id="provisioning-jobs" aria-live="polite"></div>` : "";
+  if (!hostedServersLoaded) return jobs + `<div class="empty-state"><strong>Loading your servers...</strong></div>`;
+  if (hostedServersError) return jobs + `<div class="empty-state"><strong>Could not load hosted servers</strong>${esc(hostedServersError)} <button class="text-link" data-action="refresh-hosted-servers">Retry</button></div>`;
+  if (!hostedServers.length) return jobs + `<div class="empty-state"><strong>No hosted servers yet</strong>Create a server to provision your first managed VM.</div>`;
+  return jobs + `<div class="servers-grid hosted-server-grid">${hostedServers.map((server) => `<article class="server-card">
     <div class="server-card-top"><div class="server-name"><span class="server-glyph">▦</span><span><strong>${esc(server.name)}</strong><small>${esc(server.software)} ${esc(server.version)} · VM ${esc(server.vmid)}</small></span></div><span id="live-server-state-${esc(server.id)}" class="server-status ${server.state === "active" ? "" : "offline"}"><i></i>${esc(server.state === "active" ? "Online" : server.state || "Not checked")}</span></div>
     <div class="server-card-body"><div><div class="stat-label">VCPU</div><div class="stat-value">${esc(server.vcpus)}</div></div><div><div class="stat-label">MEMORY</div><div class="stat-value">${esc(server.ramMb / 1024)}<small>GiB</small></div></div><div><div class="stat-label">DISK</div><div class="stat-value">${esc(server.diskGb)}<small>GiB</small></div></div></div>
     ${server.error ? `<div class="notice">${esc(server.error)}</div>` : ""}
     <div class="hosted-live-metrics" id="live-metrics-${esc(server.id)}">Loading measured usage...</div>
     <div class="server-card-bottom"><span class="server-address">${esc(server.address)}</span><div class="heading-actions"><button class="text-link" data-action="hosted-files" data-id="${esc(server.id)}">Files / SFTP</button><button class="text-link" data-action="hosted-settings" data-id="${esc(server.id)}">Settings</button><button class="button button-primary button-small" data-action="hosted-console" data-id="${esc(server.id)}">Open console</button></div></div>
   </article>`).join("")}</div>`;
+}
+
+async function pollProvisioningJobs(generation) {
+  const accountId = currentUser?.id;
+  const valid = () => generation === consoleGeneration && currentUser?.id === accountId && !currentUser?.demo && ["overview", "servers"].includes(activePage);
+  try {
+    const response = await fetch("/api/hosting/jobs", { credentials: "same-origin", signal: AbortSignal.timeout(10000) });
+    const jobs = await response.json();
+    if (!response.ok) throw new Error(jobs.error || `Creation progress failed (${response.status}).`);
+    if (!valid()) return;
+    const element = document.getElementById("provisioning-jobs");
+    if (element) element.innerHTML = jobs.map((job) => `<div class="notice"><strong>${esc(job.name)}</strong> (${esc(job.hostname)}): ${esc(job.status)} - ${esc(job.stage)}${job.error ? `<p role="alert">${esc(job.error)}</p>` : ""}</div>`).join("");
+    const finished = jobs.filter((job) => job.status === "completed" && !completedCreationJobs.has(accountId + ":" + job.id));
+    for (const job of finished) completedCreationJobs.add(accountId + ":" + job.id);
+    if (finished.some((job) => !hostedServers.some((server) => server.id === job.id))) await loadHostedServers();
+  } catch (error) {
+    if (valid()) {
+      console.error("Could not load creation progress:", error);
+      const element = document.getElementById("provisioning-jobs");
+      if (element) element.textContent = `Creation progress unavailable: ${error.message}`;
+    }
+  } finally { if (valid()) provisioningTimer = window.setTimeout(() => pollProvisioningJobs(generation), 4000); }
 }
 
 async function loadHostedServers() {
@@ -621,7 +646,7 @@ function renderPlans() {
     return `${pageHeading("Plans & accounts", "Assign hosting plans to Discord accounts.")}<div class="notice">Live plan management is available to signed-in site administrators.</div>`;
   }
   return `${pageHeading("Plans & accounts", "Set server, CPU, memory, and disk limits for each hosting plan.", `<button class="button button-primary button-small" data-action="create-plan"><span class="plus">+</span> Create plan</button>`)}
-    <div class="notice"><strong>Admin-only:</strong> Plan limits and assignments are stored by the backend. Provisioning enforcement will be connected with the server-creation API; no VM is created from this page yet.</div>
+    <div class="notice"><strong>Admin-only:</strong> Only accounts assigned a hosting plan can create servers. Plan limits are enforced on creation requests; editing a plan does not create a VM.</div>
     <section class="panel"><div class="panel-heading"><div><h2>Hosting plans</h2><p>Per-server resource caps and maximum server count</p></div></div><div id="admin-plans"><div class="empty-state"><strong>Loading plans…</strong></div></div></section>
     <section class="panel section-spacer"><div class="panel-heading"><div><h2>Discord accounts</h2><p>Only accounts that have signed in are listed.</p></div></div><div id="admin-accounts"><div class="empty-state"><strong>Loading accounts…</strong></div></div></section>`;
 }
@@ -737,6 +762,7 @@ function renderPage() {
   window.clearTimeout(consoleTimer);
   window.clearTimeout(metricsTimer);
   window.clearTimeout(sftpTimer);
+  window.clearTimeout(provisioningTimer);
   activeEditor = null;
   consoleGeneration++;
   const renderers = { overview: renderOverview, servers: renderServers, files: renderFiles, console: renderConsole, backups: renderBackups, settings: renderSettings, infrastructure: renderInfrastructure, minecraft: renderMinecraft, plans: renderPlans };
@@ -745,6 +771,7 @@ function renderPage() {
   serverCount.textContent = String(currentUser && !currentUser.demo ? hostedServers.length : state.servers.length);
   serverCount.hidden = false;
   if (currentUser && !currentUser.demo && ["overview", "servers", "console", "files", "settings"].includes(activePage)) {
+    if (["overview", "servers"].includes(activePage)) pollProvisioningJobs(consoleGeneration);
     if (!hostedServersLoaded) loadHostedServers();
     else if (activePage === "console" && hostedServers.length) pollHostedConsole(consoleGeneration);
     if (hostedServersLoaded && hostedServers.length) {
@@ -882,30 +909,61 @@ async function assignAccountPlan(discordId, planId) {
   }
 }
 
-function createServerModal() {
+async function createServerModal() {
   if (currentUser && !currentUser.demo) {
     openModal({
       title: "Create a Minecraft server",
       subtitle: "Your assigned plan will set the limits for each server.",
-      content: `<div id="create-server-plan" class="modal-notice">Loading your plan…</div><div class="modal-notice">Automated VM provisioning is being configured. No server or public port will be created yet, and EULA consent is not recorded until a server can be created.</div>${minecraftEulaConsentField()}`,
-      submitText: "Provisioning not ready",
+      content: `<div id="create-server-plan" class="modal-notice">Checking your plan and provisioner availability...</div>`,
+      submitText: "Checking availability",
       cancelText: "Close",
       submitDisabled: true,
     });
-    fetch("/api/account/plan", { credentials: "same-origin" })
-      .then(async (response) => {
-        const plan = await response.json();
-        if (!response.ok) throw new Error(plan.error || `Plan lookup failed (${response.status}).`);
-        const summary = plan.id
-          ? `${esc(plan.name)} · ${plan.maxServers === null ? "unlimited servers" : `${esc(plan.maxServers)} server${plan.maxServers === 1 ? "" : "s"}`} · ${esc(plan.maxVcpusPerServer)} vCPU · ${esc(plan.maxRamMbPerServer)} MiB RAM · ${esc(plan.maxDiskGbPerServer)} GB disk per server.`
-          : "No hosting plan is assigned to your account yet. Contact the site administrator.";
-        const planElement = document.getElementById("create-server-plan");
-        if (planElement) planElement.textContent = summary;
-      })
-      .catch((error) => {
-        const planElement = document.getElementById("create-server-plan");
-        if (planElement) planElement.textContent = `Could not load your plan: ${error.message}`;
+    const loading = document.getElementById("create-server-plan");
+    const accountId = currentUser.id;
+    try {
+      const response = await fetch("/api/hosting/config", { credentials: "same-origin", signal: AbortSignal.timeout(10000) });
+      const config = await response.json();
+      if (!response.ok) throw new Error(config.error || `Availability lookup failed (${response.status}).`);
+      if (!loading.isConnected || currentUser?.id !== accountId || currentUser.demo) return;
+      const plan = config.plan;
+      if (!config.enabled || !config.workerReady || !plan || plan.maxRamMb < 2048 || plan.maxDiskGb < 32) {
+        loading.textContent = !plan ? "Ask the administrator to assign you a hosting plan." :
+          plan.maxRamMb < 2048 || plan.maxDiskGb < 32 ? "Your plan needs at least 2048 MiB RAM and 32 GiB disk for this Paper template." :
+          "Automated creation is not available yet. No server will be created or EULA consent recorded.";
+        return;
+      }
+      const requestId = crypto.randomUUID();
+      openModal({
+        title: "Create a Minecraft server",
+        subtitle: "Paper 26.3 / Java 25. CPU and RAM availability determine the Proxmox node.",
+        content: `<div class="modal-notice">${esc(plan.name)}: ${plan.maxServers === null ? "unlimited" : esc(plan.maxServers)} servers, including pending creations.</div>
+          <label for="server-name">Server name</label><input class="form-control" id="server-name" name="name" maxlength="48" required>
+          <label for="server-slug">Subdomain (.${esc(config.domain)})</label><input class="form-control" id="server-slug" name="slug" minlength="3" maxlength="32" pattern="[a-z0-9][a-z0-9\\-]{1,30}[a-z0-9]" placeholder="my-server" required>
+          <label for="server-cpu">vCPU</label><input class="form-control" id="server-cpu" name="vcpus" type="number" min="1" max="${esc(plan.maxVcpus)}" value="${Math.min(4, plan.maxVcpus)}" required>
+          <label for="server-ram">RAM (MiB)</label><input class="form-control" id="server-ram" name="ramMb" type="number" min="2048" max="${esc(plan.maxRamMb)}" step="256" value="${Math.min(4096, Math.floor(plan.maxRamMb / 256) * 256)}" required>
+          <label for="server-disk">Disk (GiB)</label><input class="form-control" id="server-disk" name="diskGb" type="number" min="32" max="${esc(plan.maxDiskGb)}" value="32" required>
+          ${minecraftEulaConsentField()}<div class="modal-notice">Creation can take several minutes. Progress survives page refreshes. Whitelisting defaults off; SFTP still requires your key and an IP grant.</div>`,
+        submitText: "Create server",
+        onSubmit: async (data) => {
+          const result = await fetch("/api/hosting/jobs", { method: "POST", credentials: "same-origin", signal: AbortSignal.timeout(20000),
+            headers: { "Content-Type": "application/json", "X-Blockhost-Request": "provision" },
+            body: JSON.stringify({ requestId, name: String(data.get("name")), slug: String(data.get("slug")),
+              vcpus: Number(data.get("vcpus")), ramMb: Number(data.get("ramMb")), diskGb: Number(data.get("diskGb")),
+              software: "Paper", version: "26.3", eulaAccepted: data.get("eulaAccepted") === "on" }),
+          });
+          const job = await result.json();
+          if (!result.ok) throw new Error(job.error || `Creation request failed (${result.status}).`);
+          if (currentUser?.id !== accountId || currentUser.demo) return;
+          closeModal();
+          setPage("servers");
+          showToast("Creation queued. You can follow its progress here.");
+        },
       });
+    } catch (error) {
+      console.error("Could not check provisioning availability:", error);
+      if (loading.isConnected) loading.textContent = `Could not check availability: ${error.message}`;
+    }
     return;
   }
   openModal({
@@ -1065,6 +1123,8 @@ document.getElementById("sign-out").addEventListener("click", async () => {
   hostedServersLoading = false;
   hostedServersLoaded = false;
   selectedHostedServerId = null;
+  window.clearTimeout(provisioningTimer);
+  completedCreationJobs.clear();
   document.getElementById("admin-nav").hidden = true;
   document.getElementById("plans-nav").hidden = true;
   document.querySelectorAll(".admin-nav").forEach((item) => item.hidden = true);

@@ -26,7 +26,14 @@ function readVarint(data: Buffer, offset = 0): { value: number; bytes: number } 
   throw new Error("Invalid Minecraft packet length.");
 }
 
-export function minecraftStatus(host: string, port: number, hostname: string): Promise<{ online: number; max: number }> {
+function descriptionText(value: unknown, depth = 0): string {
+  if (typeof value === "string") return value;
+  if (!value || typeof value !== "object" || depth > 16) return "";
+  const text = "text" in value && typeof value.text === "string" ? value.text : "";
+  return text + ("extra" in value && Array.isArray(value.extra) ? value.extra.map((part: unknown) => descriptionText(part, depth + 1)).join("") : "");
+}
+
+export function minecraftStatus(host: string, port: number, hostname: string, expectedBackend?: string): Promise<{ online: number; max: number }> {
   return new Promise((resolve, reject) => {
     const socket = createConnection({ host, port });
     let data = Buffer.alloc(0);
@@ -63,6 +70,7 @@ export function minecraftStatus(host: string, port: number, hostname: string): P
         if (!size || id.bytes + size.bytes + size.value !== packet.length) throw new Error("Malformed Minecraft status response.");
         const result: unknown = JSON.parse(packet.subarray(id.bytes + size.bytes).toString("utf8"));
         if (!result || typeof result !== "object" || !("players" in result)) throw new Error("No backend player status is available.");
+        if (expectedBackend && (!("description" in result) || descriptionText(result.description) !== "Blockhost - " + expectedBackend)) throw new Error("Minecraft status came from a different backend.");
         const players = result.players;
         if (!players || typeof players !== "object" || !("online" in players) || !("max" in players) ||
             typeof players.online !== "number" || !Number.isInteger(players.online) || players.online < 0 ||
