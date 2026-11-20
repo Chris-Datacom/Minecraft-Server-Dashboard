@@ -11,6 +11,7 @@ import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from "crypt
 import path from "path";
 import { createHostedServersRouter } from "./hosted-servers";
 import { createHostingManagement } from "./hosting-management";
+import { addressPool, createProvisioningRouter, provisioningSchema } from "./provisioning";
 
 interface DiscordAccount extends Express.User {
   id: string;
@@ -502,11 +503,14 @@ function decryptHostedKey(value: string): string {
   return decryptApiKey(value, Buffer.from(serverCredentialsKey, "hex"));
 }
 const hostingManagement = createHostingManagement(pool, decryptHostedKey);
+const provisioningAddresses = process.env.HOSTING_IP_START || process.env.HOSTING_IP_END
+  ? addressPool(process.env.HOSTING_IP_START || "", process.env.HOSTING_IP_END || "") : [];
+app.use("/api/hosting", createProvisioningRouter(pool, requireAuthenticated));
 app.use("/api/hosted/servers", createHostedServersRouter({
   database: pool,
   requireAuthenticated,
   adminIds: adminDiscordIds,
-  allowedHosts: new Set((process.env.HOSTED_SERVER_ALLOWED_HOSTS ?? "").split(",").map((value) => value.trim()).filter(Boolean)),
+  allowedHosts: new Set([...provisioningAddresses, ...(process.env.HOSTED_SERVER_ALLOWED_HOSTS ?? "").split(",").map((value) => value.trim()).filter(Boolean)]),
   credentialsConfigured: Boolean(serverCredentialsKey),
   decryptPrivateKey: decryptHostedKey,
   management: hostingManagement.router,
@@ -795,6 +799,7 @@ pool
       )
     `);
     await pool.query("CREATE INDEX IF NOT EXISTS sftp_access_expiry_idx ON sftp_access_grants(expires_at)");
+    await pool.query(provisioningSchema);
   })
   .then(() => {
     hostingManagement.start();

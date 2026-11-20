@@ -5,6 +5,10 @@ if [[ "${EUID}" -ne 0 ]] || [[ ! -f /etc/systemd/system/minecraft.service ]]; th
   echo "Run this helper as root on a configured Minecraft backend." >&2
   exit 1
 fi
+if [[ "${MINECRAFT_DEFER_START:-false}" != "true" && "${MINECRAFT_DEFER_START:-false}" != "false" ]]; then
+  echo "MINECRAFT_DEFER_START must be true or false." >&2
+  exit 1
+fi
 if [[ ! "${WEBSITE_IP:-}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
   echo "WEBSITE_IP must be the website VM's LAN IPv4 address." >&2
   exit 1
@@ -112,5 +116,7 @@ EOF
 systemctl daemon-reload
 systemd-analyze verify /etc/systemd/system/minecraft.service
 systemctl reload sshd.service
-systemctl restart minecraft.service
+if [[ "${MINECRAFT_DEFER_START:-false}" == "false" ]]; then
+  systemctl restart minecraft.service
+fi
 echo "Restricted Minecraft console configured; no RCON port was enabled."

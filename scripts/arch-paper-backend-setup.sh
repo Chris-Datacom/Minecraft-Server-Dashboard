@@ -13,6 +13,17 @@ if [[ "${MINECRAFT_EULA_ACCEPTED:-}" != "true" ]]; then
   echo "Explicit acceptance of https://www.minecraft.net/eula is required; set MINECRAFT_EULA_ACCEPTED=true only after consent." >&2
   exit 1
 fi
+RAM_MB="${MINECRAFT_RAM_MB:-4096}"
+SERVER_HOSTNAME="${MINECRAFT_HOSTNAME:-test.krumpy.xyz}"
+DEFER_START="${MINECRAFT_DEFER_START:-false}"
+if [[ ! "${RAM_MB}" =~ ^[0-9]+$ ]] || (( RAM_MB < 2048 || RAM_MB > 8192 || RAM_MB % 256 )) ||
+   [[ ! "${SERVER_HOSTNAME}" =~ ^[a-z0-9][a-z0-9.-]+\.[a-z]{2,}$ ]] ||
+   [[ "${DEFER_START}" != "true" && "${DEFER_START}" != "false" ]]; then
+  echo "Invalid Minecraft RAM, hostname, or deferred-start configuration." >&2
+  exit 1
+fi
+HEAP_MB="$(( RAM_MB - 1024 ))"
+MEMORY_MAX_MB="$(( RAM_MB - 256 ))"
 if [[ ! -r "${VELOCITY_FORWARDING_SECRET_FILE:-}" ]]; then
   echo "VELOCITY_FORWARDING_SECRET_FILE must name a readable secret file." >&2
   exit 1
@@ -62,13 +73,13 @@ printf '%s  %s\n' "${PAPER_SHA256}" /srv/minecraft/server.jar | sha256sum --chec
 
 install -d -o minecraft -g minecraft -m 0750 /srv/minecraft/config
 umask 027
-cat > /srv/minecraft/server.properties <<'EOF'
+cat > /srv/minecraft/server.properties <<EOF
 server-port=25565
 online-mode=false
 enforce-secure-profile=true
 white-list=false
 enforce-whitelist=false
-motd=Blockhost Test - test.krumpy.xyz
+motd=Blockhost - ${SERVER_HOSTNAME}
 max-players=20
 view-distance=8
 simulation-distance=6
@@ -119,21 +130,21 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
 install -d -o root -g root -m 0755 /etc/systemd/system/minecraft.service.d
-cat > /etc/systemd/system/minecraft.service.d/paper.conf <<'EOF'
+cat > /etc/systemd/system/minecraft.service.d/paper.conf <<EOF
 [Unit]
 Requires=minecraft-firewall.service
 After=minecraft-firewall.service
 
 [Service]
 ExecStart=
-ExecStart=/usr/lib/jvm/java-25-openjdk/bin/java $JAVA_OPTS -jar $SERVER_JAR nogui
+ExecStart=/usr/lib/jvm/java-25-openjdk/bin/java \$JAVA_OPTS -jar \$SERVER_JAR nogui
 TimeoutStopSec=120
-MemoryMax=3500M
+MemoryMax=${MEMORY_MAX_MB}M
 UMask=0027
 EOF
-cat > /etc/minecraft/server.env <<'EOF'
+cat > /etc/minecraft/server.env <<EOF
 SERVER_JAR=server.jar
-JAVA_OPTS="-Xms1G -Xmx3G"
+JAVA_OPTS="-Xms512M -Xmx${HEAP_MB}M"
 EOF
 printf 'eula=true\n' > /srv/minecraft/eula.txt
 chown minecraft:minecraft /srv/minecraft/eula.txt
@@ -146,6 +157,11 @@ systemctl daemon-reload
 systemd-analyze verify /etc/systemd/system/minecraft.service \
   /etc/systemd/system/minecraft-firewall.service
 systemctl enable --now minecraft-firewall.service
-systemctl enable --now minecraft.service
-echo "Paper 26.3 build 256 started; verify its Done message before connecting players."
+systemctl enable minecraft.service
+if [[ "${DEFER_START}" == "false" ]]; then
+  systemctl start minecraft.service
+  echo "Paper 26.3 build 256 started; verify its Done message before connecting players."
+else
+  echo "Paper configured; start deferred until console and storage setup are complete."
+fi
 echo "TCP 25565 is restricted to the Velocity gateway."
